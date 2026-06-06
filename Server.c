@@ -81,6 +81,7 @@ static int AppendUserToFile(const UserInfo* user);
 static UserNode* FindUserById(const char* id);
 static int ParseCSVFiles(void);
 static void CalculateAverages(void);
+static int ValidateLoadedData(void);
 static void SortCrimeRanks(CrimeRank* list, int count);
 static void HeapPush(CrimeMaxHeap* heap, const CrimeRank* item);
 static int HeapPop(CrimeMaxHeap* heap, CrimeRank* out);
@@ -107,7 +108,7 @@ int main(void) {
     SOCKET servSock;
     SOCKADDR_IN servAdr;
 
-    system("chcp 65001 > nul");
+    /* 콘솔 입출력 코드페이지를 UTF-8로 설정함 */
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
@@ -126,6 +127,11 @@ int main(void) {
         return 1;
     }
     CalculateAverages();
+    if (ValidateLoadedData() != 0) {
+        printf("[오류] 통계 데이터 검증 실패. CSV 파일 내용을 확인하세요.\n");
+        CleanupResources();
+        return 1;
+    }
 
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         printf("[오류] WSAStartup 실패\n");
@@ -205,6 +211,7 @@ int main(void) {
     return 0;
 }
 
+/* 클라이언트별 스레드에서 패킷을 반복 수신하고 연결 종료 시 목록에서 제거함 */
 static unsigned WINAPI ClientHandler(void* arg) {
     SOCKET sock = *((SOCKET*)arg);
     PacketHeader hdr;
@@ -238,6 +245,7 @@ static unsigned WINAPI ClientHandler(void* arg) {
     return 0;
 }
 
+/* 문자열 끝의 개행 문자를 제거함 */
 static void TrimNewline(char* str) {
     int len;
     if (!str) return;
@@ -248,6 +256,7 @@ static void TrimNewline(char* str) {
     }
 }
 
+/* CSV와 사용자 파일에서 읽은 문자열의 BOM, 공백, 따옴표를 정리함 */
 static void CleanText(char* str) {
     char* start;
     char* end;
@@ -272,6 +281,7 @@ static void CleanText(char* str) {
     if (start != str) memmove(str, start, strlen(start) + 1);
 }
 
+/* UTF-8 또는 시스템 기본 코드페이지 문자열을 UTF-8 문자열로 변환함 */
 static int ConvertBytesToUtf8(const char* src, char* out, int outSize) {
     wchar_t wide[BIG_BUF_SIZE];
     int wlen;
@@ -283,6 +293,7 @@ static int ConvertBytesToUtf8(const char* src, char* out, int outSize) {
     return WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, outSize, NULL, NULL) > 0 ? 0 : -1;
 }
 
+/* 파일에서 한 줄을 읽고 UTF-8 문자열로 정규화함 */
 static int ReadTextLine(FILE* fp, char* out, int outSize) {
     char raw[BIG_BUF_SIZE];
     if (!fgets(raw, sizeof(raw), fp)) return 0;
@@ -294,6 +305,7 @@ static int ReadTextLine(FILE* fp, char* out, int outSize) {
     return 1;
 }
 
+/* 연결 리스트에서 아이디가 일치하는 사용자를 찾음 */
 static UserNode* FindUserById(const char* id) {
     UserNode* curr = gUsers;
     while (curr) {
@@ -303,6 +315,7 @@ static UserNode* FindUserById(const char* id) {
     return NULL;
 }
 
+/* users.txt 파일을 읽어 사용자 연결 리스트를 구성함 */
 static int LoadUserDatabase(void) {
     FILE* fp = fopen("users.txt", "rb");
     char line[BUF_SIZE];
@@ -338,6 +351,7 @@ static int LoadUserDatabase(void) {
     return 0;
 }
 
+/* 신규 회원 정보를 users.txt 파일 끝에 저장함. */
 static int AppendUserToFile(const UserInfo* user) {
     FILE* fp = fopen("users.txt", "ab");
     if (!fp) return -1;
@@ -346,6 +360,7 @@ static int AppendUserToFile(const UserInfo* user) {
     return 0;
 }
 
+/* CrimeStats.csv와 PoliceStats.csv를 읽어 서버 메모리 자료구조로 적재함 */
 static int ParseCSVFiles(void) {
     FILE* fp;
     char line[BIG_BUF_SIZE];
@@ -421,6 +436,55 @@ static int ParseCSVFiles(void) {
     return 0;
 }
 
+/* 적재된 통계 데이터가 요청 처리에 필요한 최소 조건을 만족하는지 검증함 */
+static int ValidateLoadedData(void) {
+    int provinceIndex;
+    CrimeNode* crime = gCrimes;
+    PoliceNode* police = gPolice;
+
+    if (gRegionCount <= 0 || gRegionCount > MAX_REGIONS) {
+        printf("[검증 실패] 범죄 지역 개수가 올바르지 않습니다. regionCount=%d\n", gRegionCount);
+        return -1;
+    }
+    if (!crime) {
+        printf("[검증 실패] 범죄 통계 행이 없습니다.\n");
+        return -1;
+    }
+    if (!police) {
+        printf("[검증 실패] 경찰 통계 행이 없습니다.\n");
+        return -1;
+    }
+    if (gNationalAvgCrime <= 0.0 || gNationalAvgPeoplePerOfficer <= 0.0) {
+        printf("[검증 실패] 전국 평균 계산값이 올바르지 않습니다.\n");
+        return -1;
+    }
+
+    for (provinceIndex = 1; provinceIndex <= (int)(sizeof(gProvinces) / sizeof(gProvinces[0])); provinceIndex++) {
+        int foundCity = 0;
+        int i;
+        PoliceSummary summary;
+
+        for (i = 0; i < gRegionCount; i++) {
+            if (RegionBelongsToProvince(i, provinceIndex)) {
+                foundCity = 1;
+                break;
+            }
+        }
+        if (!foundCity) {
+            printf("[검증 실패] %s에 해당하는 범죄 지역이 없습니다.\n", gProvinces[provinceIndex - 1].officialName);
+            return -1;
+        }
+        if (!GetPoliceSummaryByProvince(provinceIndex, &summary)) {
+            printf("[검증 실패] %s에 해당하는 경찰 통계가 없습니다.\n", gProvinces[provinceIndex - 1].officialName);
+            return -1;
+        }
+    }
+
+    printf("[검증] CSV 데이터와 지역 매핑 검증을 완료했습니다.\n");
+    return 0;
+}
+
+/* 전체 범죄 평균과 경찰 담당 인구 평균을 계산함 */
 static void CalculateAverages(void) {
     long long totalCrime = 0;
     long long totalPopulation = 0;
@@ -443,12 +507,14 @@ static void CalculateAverages(void) {
     if (totalOfficers > 0) gNationalAvgPeoplePerOfficer = (double)totalPopulation / totalOfficers;
 }
 
+/* 범죄 순위 항목 두 개를 교환함 */
 static void SwapCrimeRank(CrimeRank* a, CrimeRank* b) {
     CrimeRank tmp = *a;
     *a = *b;
     *b = tmp;
 }
 
+/* 최대 힙을 이용해 범죄 건수를 내림차순으로 정렬함 */
 static void SortCrimeRanks(CrimeRank* list, int count) {
     CrimeMaxHeap heap;
     CrimeRank item;
@@ -464,6 +530,7 @@ static void SortCrimeRanks(CrimeRank* list, int count) {
     }
 }
 
+/* 최대 힙에 범죄 순위 항목을 삽입함 */
 static void HeapPush(CrimeMaxHeap* heap, const CrimeRank* item) {
     int idx;
     if (!heap || !item || heap->size >= MAX_CRIME_ROWS) return;
@@ -479,6 +546,7 @@ static void HeapPush(CrimeMaxHeap* heap, const CrimeRank* item) {
     }
 }
 
+/* 최대 힙에서 가장 큰 범죄 순위 항목을 꺼냄 */
 static int HeapPop(CrimeMaxHeap* heap, CrimeRank* out) {
     int idx = 0;
 
@@ -506,6 +574,7 @@ static int HeapPop(CrimeMaxHeap* heap, CrimeRank* out) {
     return 1;
 }
 
+/* 특정 범죄 지역이 선택한 도/시에 속하는지 확인함 */
 static int RegionBelongsToProvince(int regionIndex, int provinceIndex) {
     const char* region;
     const char* prefix;
@@ -516,6 +585,7 @@ static int RegionBelongsToProvince(int regionIndex, int provinceIndex) {
     return strncmp(region, prefix, strlen(prefix)) == 0;
 }
 
+/* 도/시 번호와 시/군/구 번호를 실제 범죄 지역 배열 인덱스로 변환함 */
 static int ResolveCityIndex(int provinceIndex, int cityNumber) {
     int i;
     int count = 0;
@@ -529,6 +599,7 @@ static int ResolveCityIndex(int provinceIndex, int cityNumber) {
     return -1;
 }
 
+/* 클라이언트 Payload의 "도/시번호\t시군구번호" 값을 범죄 지역 인덱스로 변환함 */
 static int ResolveRegionSelection(const char* payload) {
     char buf[BUF_SIZE];
     char* p;
@@ -542,6 +613,7 @@ static int ResolveRegionSelection(const char* payload) {
     return ResolveCityIndex(atoi(p), atoi(c));
 }
 
+/* 선택한 범죄 지역의 전체 범죄 발생 건수를 합산함 */
 static long long GetRegionCrimeTotal(int regionIndex) {
     long long total = 0;
     CrimeNode* curr = gCrimes;
@@ -552,6 +624,7 @@ static long long GetRegionCrimeTotal(int regionIndex) {
     return total;
 }
 
+/* 선택한 도/시의 경찰 통계를 요약하고 경기도 남부/북부처럼 분리된 행은 합산함 */
 static int GetPoliceSummaryByProvince(int provinceIndex, PoliceSummary* out) {
     const ProvinceInfo* province;
     PoliceNode* curr;
@@ -588,6 +661,7 @@ static int GetPoliceSummaryByProvince(int provinceIndex, PoliceSummary* out) {
     return 1;
 }
 
+/* 범죄 지역명에서 상위 도/시 인덱스를 찾음 */
 static int ProvinceIndexFromRegion(int regionIndex) {
     int i;
     for (i = 1; i <= (int)(sizeof(gProvinces) / sizeof(gProvinces[0])); i++) {
@@ -596,6 +670,7 @@ static int ProvinceIndexFromRegion(int regionIndex) {
     return -1;
 }
 
+/* 클라이언트가 선택할 수 있는 도/시 목록 문자열을 생성함 */
 static void BuildProvinceList(char* out, int outSize) {
     int i;
     int used = 0;
@@ -609,6 +684,7 @@ static void BuildProvinceList(char* out, int outSize) {
     }
 }
 
+/* 선택한 도/시에 속한 시/군/구 목록 문자열을 생성함 */
 static void BuildCityList(int provinceIndex, char* out, int outSize) {
     int i;
     int count = 0;
@@ -635,12 +711,14 @@ static void BuildCityList(int provinceIndex, char* out, int outSize) {
     if (count == 0) snprintf(out, outSize, "해당 도/시에 표시할 시/군/구 데이터가 없습니다.");
 }
 
+/* 출력 버퍼에 일반 문자열을 안전하게 이어 붙임 */
 static void AppendText(char* out, int outSize, int* used, const char* text) {
     if (!out || !used || !text || *used >= outSize) return;
     *used += snprintf(out + *used, outSize - *used, "%s", text);
     if (*used >= outSize) *used = outSize - 1;
 }
 
+/* 출력 버퍼에 형식 문자열을 안전하게 이어 붙임 */
 static void AppendFormat(char* out, int outSize, int* used, const char* fmt, ...) {
     va_list args;
     int written;
@@ -655,6 +733,7 @@ static void AppendFormat(char* out, int outSize, int* used, const char* fmt, ...
     if (*used >= outSize) *used = outSize - 1;
 }
 
+/* 지역별 범죄 발생 현황, 전체 순위, 안전 등급 결과 문자열을 생성함 */
 static void BuildCrimeAndSafety(int regionIndex, char* out, int outSize) {
     CrimeRank list[MAX_CRIME_ROWS];
     CrimeNode* c = gCrimes;
@@ -717,6 +796,7 @@ static void BuildCrimeAndSafety(int regionIndex, char* out, int outSize) {
         "   본 프로젝트에서 전국 평균 대비 비율로 산출한 참고 지표입니다.");
 }
 
+/* 도/시별 경찰 인프라 통계와 치안 서비스 대응력 결과 문자열을 생성함 */
 static void BuildPoliceAndResponse(int provinceIndex, char* out, int outSize) {
     PoliceSummary police;
     double ratio;
@@ -749,6 +829,7 @@ static void BuildPoliceAndResponse(int provinceIndex, char* out, int outSize) {
         gNationalAvgPeoplePerOfficer, ratio, status);
 }
 
+/* 대표 범죄 유형에 맞는 사용자 행동 가이드 문장을 반환함 */
 static const char* GetCrimeGuide(const char* crimeName) {
     if (!crimeName) return "기본 생활 안전수칙을 지키고 위험 상황은 112에 신고하세요.";
 
@@ -803,6 +884,7 @@ static const char* GetCrimeGuide(const char* crimeName) {
     return "주요 생활권의 조명, CCTV, 귀가 동선을 확인하고 위험 상황은 직접 해결하려 하지 말고 신고하세요.";
 }
 
+/* 실질 치안 위험도와 맞춤형 가이드라인 결과 문자열을 생성함 */
 static void BuildRiskAndGuide(int regionIndex, char* out, int outSize) {
     CrimeRank list[MAX_CRIME_ROWS];
     CrimeNode* c = gCrimes;
@@ -888,14 +970,17 @@ static void BuildRiskAndGuide(int regionIndex, char* out, int outSize) {
         "  경찰 또는 지자체 민원 채널에 전달하세요.");
 }
 
+/* 정상 처리 결과를 공통 응답 패킷으로 전송함 */
 static void SendText(SOCKET sock, const char* text) {
     SendPacket(sock, PKT_RES_TEXT, text ? text : "");
 }
 
+/* 오류 안내 결과를 공통 오류 패킷으로 전송함 */
 static void SendError(SOCKET sock, const char* text) {
     SendPacket(sock, PKT_ERROR_RES, text ? text : "");
 }
 
+/* 클라이언트 요청 타입에 따라 로그인, 회원가입, 목록 조회, 통계 분석을 분기 처리함 */
 static void HandleClientRequest(SOCKET sock, PacketHeader hdr, char* payload) {
     char res[BIG_BUF_SIZE];
 
