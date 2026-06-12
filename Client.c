@@ -1,15 +1,18 @@
 // 프로젝트명 : 당신의 지역은 괜찮아요? (Is it safe around where you LIVE?)
 // 파일명 : Client.c
-/*  설명  : 치안 통계 분석 서버에 접속하여 로그인, 회원가입, 지역별 범죄 및 치안 인프라 통계 조회,
-            실질 치안 위험도 분석과 맞춤형 가이드라인 제공 기능을 수행하는 클라이언트 프로그램 */
+/*  설명  : 치안 통계 분석 서버에 접속하여 로그인, 회원가입, 지역 선택, 기능 요청, 
+            결과 출력을 수행하는 클라이언트 프로그램 역할                         */
 // 작성자 : 2023243047 박교범
 // 작성일 : 2026-05-25 ~ 2026-06-15
 
 #include "Common.h"
 
+// [서버 연결 소켓] 클라이언트가 서버와 통신할 때 사용하는 TCP 소켓
 static SOCKET gSock = INVALID_SOCKET;
+// [로그인 상태값] 초기 메뉴와 메인 메뉴를 구분하기 위해 로그인 여부를 저장함
 static int gLoggedIn = 0;
 
+// [클라이언트 함수 선언] 화면 대기, 입력, 요청 전송, 지역 선택, 메뉴 처리를 미리 선언함
 static void PauseScreen(void);
 static void TrimNewline(char* str);
 static int GetStringInput(char* buffer, int maxSize, const char* prompt);
@@ -21,11 +24,12 @@ static int SelectCity(int provinceIndex);
 static void ShowInitialMenu(void);
 static void ShowMainMenu(void);
 
+// [프로그램 시작 함수] 서버 접속을 준비하고 로그인 상태에 맞는 메뉴를 반복 실행하는 함수
 int main(void) {
     WSADATA wsaData;
     SOCKADDR_IN servAdr;
 
-    /* 콘솔 입출력 코드페이지를 UTF-8로 설정함 */
+    // [콘솔 인코딩 설정] 한글 입출력이 깨지지 않도록 UTF-8 코드페이지를 적용함
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
@@ -60,14 +64,14 @@ int main(void) {
     }
 }
 
-/* 결과 화면을 사용자가 읽을 수 있도록 엔터 입력을 기다림 */
+// [결과 화면 대기] 조회 결과가 바로 사라지지 않도록 엔터 입력을 기다리는 함수
 static void PauseScreen(void) {
     char tmp[8];
     printf("\n계속하려면 엔터를 누르세요...");
     fgets(tmp, sizeof(tmp), stdin);
 }
 
-/* 입력 문자열 끝의 개행 문자를 제거함 */
+// [개행 제거 처리] fgets로 입력된 문자열 끝의 줄바꿈 문자를 지우는 함수
 static void TrimNewline(char* str) {
     int len;
     if (!str) return;
@@ -78,7 +82,7 @@ static void TrimNewline(char* str) {
     }
 }
 
-/* 프롬프트를 출력하고 한 줄 문자열 입력을 받음 */
+// [문자열 입력 함수] 아이디, 비밀번호, 지역명처럼 문장형 입력을 한 줄로 받는 함수
 static int GetStringInput(char* buffer, int maxSize, const char* prompt) {
     printf("%s", prompt);
     if (!fgets(buffer, maxSize, stdin)) return 0;
@@ -86,7 +90,7 @@ static int GetStringInput(char* buffer, int maxSize, const char* prompt) {
     return (int)strlen(buffer);
 }
 
-/* 프롬프트를 출력하고 정수 메뉴 입력을 받음 */
+// [숫자 입력 함수] 메뉴 번호와 지역 번호처럼 정수 선택값을 입력받는 함수
 static int GetIntInput(int* value, const char* prompt) {
     char buf[32];
     printf("%s", prompt);
@@ -95,7 +99,7 @@ static int GetIntInput(int* value, const char* prompt) {
     return 1;
 }
 
-/* 서버에 목록 요청을 보내고 응답 문자열을 호출자 버퍼에 저장함 */
+// [목록 요청 함수] 지역 목록처럼 화면에 바로 출력하기 전 필요한 응답 문자열을 받아오는 함수
 static int RequestText(PacketType type, const char* payload, char* out, int outSize) {
     PacketHeader hdr;
 
@@ -115,7 +119,7 @@ static int RequestText(PacketType type, const char* payload, char* out, int outS
     return 0;
 }
 
-/* 서버에 기능 요청을 보내고 응답을 화면에 출력함 */
+// [기능 실행 함수] 로그인과 통계 조회 요청을 서버에 보내고 결과 문장을 화면에 출력하는 함수
 static int RequestAndShow(PacketType type, const char* payload, int pauseAfter) {
     PacketHeader hdr;
     char res[BIG_BUF_SIZE];
@@ -150,7 +154,7 @@ static int RequestAndShow(PacketType type, const char* payload, int pauseAfter) 
     return 0;
 }
 
-/* 서버에서 도/시 목록을 받아 출력하고 사용자의 선택 번호를 반환함 */
+// [도시 선택 화면] 서버에서 도/시 목록을 받아 보여주고 선택 번호를 반환하는 함수
 static int SelectProvince(void) {
     char list[BIG_BUF_SIZE];
     int provinceIndex = 0;
@@ -166,7 +170,7 @@ static int SelectProvince(void) {
     return provinceIndex;
 }
 
-/* 선택한 도/시에 속한 시/군/구 목록을 받아 출력하고 선택 번호를 반환함 */
+// [시군구 선택 화면] 선택한 도/시에 포함된 하위 지역 목록을 받아 선택 번호를 반환하는 함수
 static int SelectCity(int provinceIndex) {
     char payload[32];
     char list[BIG_BUF_SIZE];
@@ -184,7 +188,7 @@ static int SelectCity(int provinceIndex) {
     return cityIndex;
 }
 
-/* 로그인 전 초기 메뉴를 출력하고 로그인, 회원가입, 종료를 처리함 */
+// [인증 메뉴 처리] 로그인 전 화면에서 로그인, 회원가입, 종료 선택을 처리하는 함수
 static void ShowInitialMenu(void) {
     int menu = 0;
 
@@ -236,7 +240,7 @@ static void ShowInitialMenu(void) {
     }
 }
 
-/* 로그인 후 지역 치안 분석 메뉴를 출력하고 선택한 기능을 실행함 */
+// [분석 메뉴 처리] 로그인 후 범죄 통계, 치안 인프라, 실질 위험도 기능을 실행하는 함수
 static void ShowMainMenu(void) {
     int menu = 0;
 

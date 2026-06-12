@@ -1,45 +1,52 @@
 // 프로젝트명 : 당신의 지역은 괜찮아요? (Is it safe around where you LIVE?)
 // 파일명 : Server.c
-/*  설명  : 치안 통계 분석 서버 프로그램으로 클라이언트의 로그인 및 회원가입 요청 처리,
-            지역별 범죄 및 치안 인프라 통계 조회, 실질 치안 위험도 분석과 맞춤형 가이드라인 제공 기능 구현 */
+/*  설명  : 클라이언트 요청을 받아 사용자 관리, CSV 데이터 로드, 통계 분석, 위험도 산출, 
+            응답 전송을 수행하는 서버 프로그램 역할                                     */
 // 작성자 : 2023243047 박교범
 // 작성일 : 2026-05-25 ~ 2026-06-15
 
 #include "Common.h"
 #include <stdarg.h>
 
+// [지역 헤더 구조체] CrimeStats.csv의 지역명 헤더 한 칸을 저장하는 역할
 typedef struct {
-    char regionName[REGION_SIZE];
+    char regionName[REGION_SIZE];     // 범죄 통계 CSV에 있는 지역명
 } RegionHeader;
 
+// [사용자 연결 노드] 사용자 계정 정보를 연결 리스트 형태로 이어 주는 역할
 typedef struct UserNode {
-    UserInfo info;
-    struct UserNode* next;
+    UserInfo info;             // 사용자 아이디, 비밀번호, 나이, 지역 정보
+    struct UserNode* next;     // 다음 사용자 노드 주소
 } UserNode;
 
+// [범죄 순위 항목] 특정 지역의 범죄 유형명과 발생 건수를 순위 계산용으로 저장함
 typedef struct {
-    char name[REGION_SIZE * 2];
-    int count;
+    char name[REGION_SIZE * 2];     // 범죄 대분류와 소분류를 합친 이름
+    int count;                      // 해당 범죄의 발생 건수
 } CrimeRank;
 
+// [범죄 최대 힙] 범죄 발생 건수가 큰 항목을 먼저 꺼내기 위한 자료구조 역할
 typedef struct {
-    CrimeRank items[MAX_CRIME_ROWS];
-    int size;
+    CrimeRank items[MAX_CRIME_ROWS];    // 힙에 저장되는 범죄 순위 항목 배열
+    int size;                           // 현재 힙에 저장된 항목 개수
 } CrimeMaxHeap;
 
+// [도시 매핑 정보] 메뉴 표시명, 공식 지역명, 범죄 CSV 접두어를 함께 보관함
 typedef struct {
-    char shortName[32];
-    char officialName[64];
-    char crimePrefix[32];
+    char shortName[32];       // 클라이언트 메뉴에 출력할 짧은 지역명
+    char officialName[64];    // 경찰 통계와 비교할 공식 지역명
+    char crimePrefix[32];     // 범죄 통계 지역명과 비교할 접두어
 } ProvinceInfo;
 
+// [경찰 요약 정보] 선택한 도/시의 경찰관 수와 담당 인구 계산값을 저장함
 typedef struct {
-    char name[REGION_SIZE];
-    int officerCount;
-    int population;
-    int popPerOfficer;
+    char name[REGION_SIZE];     // 도/시 공식 지역명
+    int officerCount;           // 해당 도/시의 경찰관 수
+    int population;             // 해당 도/시의 담당 인구수
+    int popPerOfficer;          // 경찰관 1인당 담당 인구수
 } PoliceSummary;
 
+// [도시 매핑 배열] 클라이언트 메뉴 번호와 CSV 지역명을 연결해 주는 기준표 역할
 static const ProvinceInfo gProvinces[] = {
     {"서울", "서울특별시", "서울"},
     {"부산", "부산광역시", "부산"},
@@ -60,28 +67,42 @@ static const ProvinceInfo gProvinces[] = {
     {"제주", "제주특별자치도", "제주"}
 };
 
+// [접속자 목록] 현재 서버에 연결된 클라이언트들을 연결 리스트로 저장함
 static ClientNode* gClients = NULL;
+// [사용자 목록] users.txt에서 읽은 계정 정보를 메모리 연결 리스트로 저장함
 static UserNode* gUsers = NULL;
+// [범죄 통계 목록] CrimeStats.csv의 범죄 유형별 통계 행을 연결 리스트로 저장함
 static CrimeNode* gCrimes = NULL;
+// [경찰 통계 목록] PoliceStats.csv의 지역별 경찰 인프라 정보를 연결 리스트로 저장함
 static PoliceNode* gPolice = NULL;
+// [범죄 지역 배열] 범죄 통계 CSV 헤더에 있는 지역명들을 순서대로 저장함
 static RegionHeader gRegions[MAX_REGIONS];
+// [범죄 지역 개수] CSV에서 실제로 읽어 온 지역 수를 저장함
 static int gRegionCount = 0;
+// [공유 자원 잠금] 여러 스레드가 클라이언트 목록을 동시에 바꾸지 못하게 보호함
 static HANDLE gMutex;
+// [전국 범죄 평균] 지역별 총 범죄 발생 건수의 전국 평균값을 저장함
 static double gNationalAvgCrime = 0.0;
+// [전국 경찰 부담 평균] 경찰관 1인당 담당 인구수의 전국 평균값을 저장함
 static double gNationalAvgPeoplePerOfficer = 0.0;
 
+// [접속 처리 선언] 클라이언트 스레드 실행과 패킷 분기 처리를 미리 선언함
 static unsigned WINAPI ClientHandler(void* arg);
 static void HandleClientRequest(SOCKET sock, PacketHeader hdr, char* payload);
+// [텍스트 정리 선언] 개행 제거, 공백 정리, 인코딩 변환, 파일 한 줄 읽기를 미리 선언함
 static void TrimNewline(char* str);
 static void CleanText(char* str);
 static int ConvertBytesToUtf8(const char* src, char* out, int outSize);
 static int ReadTextLine(FILE* fp, char* out, int outSize);
+// [계정 관리 선언] 사용자 계정 로드, 신규 저장, 아이디 검색을 미리 선언함
 static int LoadUserDatabase(void);
 static int AppendUserToFile(const UserInfo* user);
 static UserNode* FindUserById(const char* id);
+// [통계 준비 선언] CSV 적재, 전국 평균 계산, 데이터 검증을 미리 선언함
 static int ParseCSVFiles(void);
 static void CalculateAverages(void);
 static int ValidateLoadedData(void);
+// [순위 지역 선언] 범죄 순위 정렬과 지역 선택값 변환에 필요한 함수를 미리 선언함
 static void SortCrimeRanks(CrimeRank* list, int count);
 static void HeapPush(CrimeMaxHeap* heap, const CrimeRank* item);
 static int HeapPop(CrimeMaxHeap* heap, CrimeRank* out);
@@ -91,6 +112,7 @@ static int ResolveCityIndex(int provinceIndex, int cityNumber);
 static long long GetRegionCrimeTotal(int regionIndex);
 static int GetPoliceSummaryByProvince(int provinceIndex, PoliceSummary* out);
 static int ProvinceIndexFromRegion(int regionIndex);
+// [결과 문장 선언] 클라이언트에 보낼 목록, 통계, 위험도 안내 문장 생성을 미리 선언함
 static void BuildProvinceList(char* out, int outSize);
 static void BuildCityList(int provinceIndex, char* out, int outSize);
 static void BuildCrimeAndSafety(int regionIndex, char* out, int outSize);
@@ -99,16 +121,18 @@ static void BuildRiskAndGuide(int regionIndex, char* out, int outSize);
 static const char* GetCrimeGuide(const char* crimeName);
 static void AppendText(char* out, int outSize, int* used, const char* text);
 static void AppendFormat(char* out, int outSize, int* used, const char* fmt, ...);
+// [패킷 정리 선언] 정상/오류 응답 전송과 서버 메모리 해제를 미리 선언함
 static void SendText(SOCKET sock, const char* text);
 static void SendError(SOCKET sock, const char* text);
 static void CleanupResources(void);
 
+// [서버 시작 함수] 데이터 로드 후 서버 소켓을 열고 클라이언트 접속을 계속 받는 함수
 int main(void) {
     WSADATA wsaData;
     SOCKET servSock;
     SOCKADDR_IN servAdr;
 
-    /* 콘솔 입출력 코드페이지를 UTF-8로 설정함 */
+    // [콘솔 인코딩 설정] 서버 콘솔에서 한글 로그가 깨지지 않도록 UTF-8을 적용함
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
@@ -211,7 +235,7 @@ int main(void) {
     return 0;
 }
 
-/* 클라이언트별 스레드에서 패킷을 반복 수신하고 연결 종료 시 목록에서 제거함 */
+// [클라이언트 스레드 루틴] 한 클라이언트의 패킷 수신과 연결 종료 정리를 맡는 함수
 static unsigned WINAPI ClientHandler(void* arg) {
     SOCKET sock = *((SOCKET*)arg);
     PacketHeader hdr;
@@ -245,7 +269,7 @@ static unsigned WINAPI ClientHandler(void* arg) {
     return 0;
 }
 
-/* 문자열 끝의 개행 문자를 제거함 */
+// [줄바꿈 제거 함수] 파일이나 콘솔에서 읽은 문자열 끝의 개행 문자를 제거하는 함수
 static void TrimNewline(char* str) {
     int len;
     if (!str) return;
@@ -256,7 +280,7 @@ static void TrimNewline(char* str) {
     }
 }
 
-/* CSV와 사용자 파일에서 읽은 문자열의 BOM, 공백, 따옴표를 정리함 */
+// [CSV 문자열 정리] 파일에서 읽은 BOM, 앞뒤 공백, 감싼 따옴표를 정리하는 함수
 static void CleanText(char* str) {
     char* start;
     char* end;
@@ -281,7 +305,7 @@ static void CleanText(char* str) {
     if (start != str) memmove(str, start, strlen(start) + 1);
 }
 
-/* UTF-8 또는 시스템 기본 코드페이지 문자열을 UTF-8 문자열로 변환함 */
+// [문자 인코딩 변환] UTF-8 또는 시스템 기본 코드페이지 문자열을 UTF-8로 맞추는 함수
 static int ConvertBytesToUtf8(const char* src, char* out, int outSize) {
     wchar_t wide[BIG_BUF_SIZE];
     int wlen;
@@ -293,7 +317,7 @@ static int ConvertBytesToUtf8(const char* src, char* out, int outSize) {
     return WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, outSize, NULL, NULL) > 0 ? 0 : -1;
 }
 
-/* 파일에서 한 줄을 읽고 UTF-8 문자열로 정규화함 */
+// [텍스트 라인 읽기] 파일에서 한 줄을 읽은 뒤 서버 내부 문자열 형식으로 정리하는 함수
 static int ReadTextLine(FILE* fp, char* out, int outSize) {
     char raw[BIG_BUF_SIZE];
     if (!fgets(raw, sizeof(raw), fp)) return 0;
@@ -305,7 +329,7 @@ static int ReadTextLine(FILE* fp, char* out, int outSize) {
     return 1;
 }
 
-/* 연결 리스트에서 아이디가 일치하는 사용자를 찾음 */
+// [아이디 검색 함수] 사용자 목록에서 입력한 아이디와 같은 계정을 찾는 함수
 static UserNode* FindUserById(const char* id) {
     UserNode* curr = gUsers;
     while (curr) {
@@ -315,7 +339,7 @@ static UserNode* FindUserById(const char* id) {
     return NULL;
 }
 
-/* users.txt 파일을 읽어 사용자 연결 리스트를 구성함 */
+// [계정 파일 로드] users.txt 내용을 읽어 로그인 검사용 사용자 목록을 만드는 함수
 static int LoadUserDatabase(void) {
     FILE* fp = fopen("users.txt", "rb");
     char line[BUF_SIZE];
@@ -351,7 +375,7 @@ static int LoadUserDatabase(void) {
     return 0;
 }
 
-/* 신규 회원 정보를 users.txt 파일 끝에 저장함. */
+// [신규 계정 저장] 회원가입으로 받은 사용자 정보를 users.txt 끝에 추가하는 함수
 static int AppendUserToFile(const UserInfo* user) {
     FILE* fp = fopen("users.txt", "ab");
     if (!fp) return -1;
@@ -360,7 +384,7 @@ static int AppendUserToFile(const UserInfo* user) {
     return 0;
 }
 
-/* CrimeStats.csv와 PoliceStats.csv를 읽어 서버 메모리 자료구조로 적재함 */
+// [통계 CSV 적재] 범죄 통계와 경찰 통계 CSV를 읽어 서버 자료구조에 채우는 함수
 static int ParseCSVFiles(void) {
     FILE* fp;
     char line[BIG_BUF_SIZE];
@@ -436,7 +460,7 @@ static int ParseCSVFiles(void) {
     return 0;
 }
 
-/* 적재된 통계 데이터가 요청 처리에 필요한 최소 조건을 만족하는지 검증함 */
+// [초기 데이터 검증] 지역 매핑과 평균값이 정상적으로 준비됐는지 확인하는 함수
 static int ValidateLoadedData(void) {
     int provinceIndex;
     CrimeNode* crime = gCrimes;
@@ -484,7 +508,7 @@ static int ValidateLoadedData(void) {
     return 0;
 }
 
-/* 전체 범죄 평균과 경찰 담당 인구 평균을 계산함 */
+// [전국 평균 계산] 범죄 발생 평균과 경찰관 1인당 담당 인구 평균을 계산하는 함수
 static void CalculateAverages(void) {
     long long totalCrime = 0;
     long long totalPopulation = 0;
@@ -507,14 +531,14 @@ static void CalculateAverages(void) {
     if (totalOfficers > 0) gNationalAvgPeoplePerOfficer = (double)totalPopulation / totalOfficers;
 }
 
-/* 범죄 순위 항목 두 개를 교환함 */
+// [범죄 순위 교환] 힙 정렬 과정에서 두 범죄 순위 항목의 위치를 바꾸는 함수
 static void SwapCrimeRank(CrimeRank* a, CrimeRank* b) {
     CrimeRank tmp = *a;
     *a = *b;
     *b = tmp;
 }
 
-/* 최대 힙을 이용해 범죄 건수를 내림차순으로 정렬함 */
+// [범죄 순위 정렬] 최대 힙을 사용해 범죄 발생 건수 순서로 목록을 정렬하는 함수
 static void SortCrimeRanks(CrimeRank* list, int count) {
     CrimeMaxHeap heap;
     CrimeRank item;
@@ -530,7 +554,7 @@ static void SortCrimeRanks(CrimeRank* list, int count) {
     }
 }
 
-/* 최대 힙에 범죄 순위 항목을 삽입함 */
+// [힙 삽입 함수] 새 범죄 순위 항목을 최대 힙의 올바른 위치에 넣는 함수
 static void HeapPush(CrimeMaxHeap* heap, const CrimeRank* item) {
     int idx;
     if (!heap || !item || heap->size >= MAX_CRIME_ROWS) return;
@@ -546,7 +570,7 @@ static void HeapPush(CrimeMaxHeap* heap, const CrimeRank* item) {
     }
 }
 
-/* 최대 힙에서 가장 큰 범죄 순위 항목을 꺼냄 */
+// [힙 추출 함수] 최대 힙에서 발생 건수가 가장 큰 항목을 꺼내는 함수
 static int HeapPop(CrimeMaxHeap* heap, CrimeRank* out) {
     int idx = 0;
 
@@ -574,7 +598,7 @@ static int HeapPop(CrimeMaxHeap* heap, CrimeRank* out) {
     return 1;
 }
 
-/* 특정 범죄 지역이 선택한 도/시에 속하는지 확인함 */
+// [도시 소속 판별] 범죄 통계 지역명이 선택한 도/시 범위에 포함되는지 확인하는 함수
 static int RegionBelongsToProvince(int regionIndex, int provinceIndex) {
     const char* region;
     const char* prefix;
@@ -585,7 +609,7 @@ static int RegionBelongsToProvince(int regionIndex, int provinceIndex) {
     return strncmp(region, prefix, strlen(prefix)) == 0;
 }
 
-/* 도/시 번호와 시/군/구 번호를 실제 범죄 지역 배열 인덱스로 변환함 */
+// [시군구 번호 변환] 메뉴에서 고른 시/군/구 번호를 범죄 지역 배열 인덱스로 바꾸는 함수
 static int ResolveCityIndex(int provinceIndex, int cityNumber) {
     int i;
     int count = 0;
@@ -599,7 +623,7 @@ static int ResolveCityIndex(int provinceIndex, int cityNumber) {
     return -1;
 }
 
-/* 클라이언트 Payload의 "도/시번호\t시군구번호" 값을 범죄 지역 인덱스로 변환함 */
+// [요청 지역 해석] 클라이언트 Payload에 들어 있는 도/시와 시/군/구 번호를 분석하는 함수
 static int ResolveRegionSelection(const char* payload) {
     char buf[BUF_SIZE];
     char* p;
@@ -613,7 +637,7 @@ static int ResolveRegionSelection(const char* payload) {
     return ResolveCityIndex(atoi(p), atoi(c));
 }
 
-/* 선택한 범죄 지역의 전체 범죄 발생 건수를 합산함 */
+// [지역 범죄 합계] 선택한 지역에서 발생한 모든 범죄 건수를 더하는 함수
 static long long GetRegionCrimeTotal(int regionIndex) {
     long long total = 0;
     CrimeNode* curr = gCrimes;
@@ -624,7 +648,7 @@ static long long GetRegionCrimeTotal(int regionIndex) {
     return total;
 }
 
-/* 선택한 도/시의 경찰 통계를 요약하고 경기도 남부/북부처럼 분리된 행은 합산함 */
+// [경찰 통계 요약] 선택한 도/시의 경찰관 수와 인구를 합산해 대응력 계산값을 만드는 함수
 static int GetPoliceSummaryByProvince(int provinceIndex, PoliceSummary* out) {
     const ProvinceInfo* province;
     PoliceNode* curr;
@@ -661,7 +685,7 @@ static int GetPoliceSummaryByProvince(int provinceIndex, PoliceSummary* out) {
     return 1;
 }
 
-/* 범죄 지역명에서 상위 도/시 인덱스를 찾음 */
+// [상위 도시 찾기] 선택한 범죄 지역이 어느 도/시에 속하는지 인덱스로 찾는 함수
 static int ProvinceIndexFromRegion(int regionIndex) {
     int i;
     for (i = 1; i <= (int)(sizeof(gProvinces) / sizeof(gProvinces[0])); i++) {
@@ -670,7 +694,7 @@ static int ProvinceIndexFromRegion(int regionIndex) {
     return -1;
 }
 
-/* 클라이언트가 선택할 수 있는 도/시 목록 문자열을 생성함 */
+// [도시 목록 생성] 클라이언트 메뉴에 출력할 도/시 선택 목록을 만드는 함수
 static void BuildProvinceList(char* out, int outSize) {
     int i;
     int used = 0;
@@ -684,7 +708,7 @@ static void BuildProvinceList(char* out, int outSize) {
     }
 }
 
-/* 선택한 도/시에 속한 시/군/구 목록 문자열을 생성함 */
+// [시군구 목록 생성] 선택한 도/시에 포함된 하위 지역 선택 목록을 만드는 함수
 static void BuildCityList(int provinceIndex, char* out, int outSize) {
     int i;
     int count = 0;
@@ -711,14 +735,14 @@ static void BuildCityList(int provinceIndex, char* out, int outSize) {
     if (count == 0) snprintf(out, outSize, "해당 도/시에 표시할 시/군/구 데이터가 없습니다.");
 }
 
-/* 출력 버퍼에 일반 문자열을 안전하게 이어 붙임 */
+// [문자열 추가 함수] 결과 버퍼에 일반 문장을 길이 초과 없이 이어 붙이는 함수
 static void AppendText(char* out, int outSize, int* used, const char* text) {
     if (!out || !used || !text || *used >= outSize) return;
     *used += snprintf(out + *used, outSize - *used, "%s", text);
     if (*used >= outSize) *used = outSize - 1;
 }
 
-/* 출력 버퍼에 형식 문자열을 안전하게 이어 붙임 */
+// [형식 문자열 추가] printf 형식의 문장을 결과 버퍼에 안전하게 이어 붙이는 함수
 static void AppendFormat(char* out, int outSize, int* used, const char* fmt, ...) {
     va_list args;
     int written;
@@ -733,7 +757,7 @@ static void AppendFormat(char* out, int outSize, int* used, const char* fmt, ...
     if (*used >= outSize) *used = outSize - 1;
 }
 
-/* 지역별 범죄 발생 현황, 전체 순위, 안전 등급 결과 문자열을 생성함 */
+// [범죄 통계 응답] 선택 지역의 범죄 현황, Top 3, 안전 등급 문장을 만드는 함수
 static void BuildCrimeAndSafety(int regionIndex, char* out, int outSize) {
     CrimeRank list[MAX_CRIME_ROWS];
     CrimeNode* c = gCrimes;
@@ -796,7 +820,7 @@ static void BuildCrimeAndSafety(int regionIndex, char* out, int outSize) {
         "   본 프로젝트에서 전국 평균 대비 비율로 산출한 참고 지표입니다.");
 }
 
-/* 도/시별 경찰 인프라 통계와 치안 서비스 대응력 결과 문자열을 생성함 */
+// [경찰 인프라 응답] 선택 도/시의 경찰관 수, 담당 인구, 대응력 판단 문장을 만드는 함수
 static void BuildPoliceAndResponse(int provinceIndex, char* out, int outSize) {
     PoliceSummary police;
     double ratio;
@@ -829,7 +853,7 @@ static void BuildPoliceAndResponse(int provinceIndex, char* out, int outSize) {
         gNationalAvgPeoplePerOfficer, ratio, status);
 }
 
-/* 대표 범죄 유형에 맞는 사용자 행동 가이드 문장을 반환함 */
+// [예방 가이드 선택] 대표 범죄 유형에 어울리는 생활 안전 수칙 문장을 고르는 함수
 static const char* GetCrimeGuide(const char* crimeName) {
     if (!crimeName) return "기본 생활 안전수칙을 지키고 위험 상황은 112에 신고하세요.";
 
@@ -884,7 +908,7 @@ static const char* GetCrimeGuide(const char* crimeName) {
     return "주요 생활권의 조명, CCTV, 귀가 동선을 확인하고 위험 상황은 직접 해결하려 하지 말고 신고하세요.";
 }
 
-/* 실질 치안 위험도와 맞춤형 가이드라인 결과 문자열을 생성함 */
+// [실질 위험도 응답] 범죄 위험도와 치안 부담을 함께 반영한 위험도 안내를 만드는 함수
 static void BuildRiskAndGuide(int regionIndex, char* out, int outSize) {
     CrimeRank list[MAX_CRIME_ROWS];
     CrimeNode* c = gCrimes;
@@ -970,17 +994,17 @@ static void BuildRiskAndGuide(int regionIndex, char* out, int outSize) {
         "  경찰 또는 지자체 민원 채널에 전달하세요.");
 }
 
-/* 정상 처리 결과를 공통 응답 패킷으로 전송함 */
+// [정상 응답 송신] 분석 성공 결과를 PKT_RES_TEXT 패킷으로 보내는 함수
 static void SendText(SOCKET sock, const char* text) {
     SendPacket(sock, PKT_RES_TEXT, text ? text : "");
 }
 
-/* 오류 안내 결과를 공통 오류 패킷으로 전송함 */
+// [오류 응답 송신] 잘못된 요청이나 처리 실패 내용을 PKT_ERROR_RES 패킷으로 보내는 함수
 static void SendError(SOCKET sock, const char* text) {
     SendPacket(sock, PKT_ERROR_RES, text ? text : "");
 }
 
-/* 클라이언트 요청 타입에 따라 로그인, 회원가입, 목록 조회, 통계 분석을 분기 처리함 */
+// [패킷 요청 분기] 수신한 메시지 타입에 따라 로그인, 회원가입, 목록, 분석 기능을 나누어 실행하는 함수
 static void HandleClientRequest(SOCKET sock, PacketHeader hdr, char* payload) {
     char res[BIG_BUF_SIZE];
 
@@ -1093,6 +1117,7 @@ static void HandleClientRequest(SOCKET sock, PacketHeader hdr, char* payload) {
     SendError(sock, "지원하지 않는 요청입니다.");
 }
 
+// [서버 메모리 해제] 서버가 사용한 클라이언트, 사용자, 범죄, 경찰 통계 노드를 정리하는 함수
 static void CleanupResources(void) {
     while (gClients) {
         ClientNode* next = gClients->next;
